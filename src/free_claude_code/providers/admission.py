@@ -37,6 +37,9 @@ UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS = 10
 DEFAULT_UPSTREAM_BASE_DELAY = 2.0
 DEFAULT_UPSTREAM_MAX_DELAY = 60.0
 DEFAULT_UPSTREAM_JITTER = 1.0
+# When retry attempts are exhausted and the provider gave no Retry-After
+# hint, assume it needs a long rest instead of the ~60s capped backoff.
+DEFAULT_PROVIDER_COOLDOWN = 24.0 * 60.0 * 60.0
 
 _quiet_discovery = ContextVar("quiet_discovery_recovery_logs", default=False)
 
@@ -784,9 +787,13 @@ class ProviderAdmissionController:
                 episode.waiters.add(execution)
             self._notify_recovery_waiters()
         elif episode is None or matching_probe is not None:
-            terminal_delay = self._retry_delay(
-                error,
-                execution.attempts_started,
+            # Retries are exhausted. Trust the provider's own Retry-After
+            # hint if it gave one; otherwise this is a sustained outage, not
+            # a transient blip, so rest much longer than the capped backoff
+            # instead of hammering it again within the minute.
+            retry_after = _retry_after_seconds(error)
+            terminal_delay = (
+                retry_after if retry_after is not None else DEFAULT_PROVIDER_COOLDOWN
             )
             if episode is None:
                 episode = self._start_recovery_episode(
