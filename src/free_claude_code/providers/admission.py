@@ -40,6 +40,13 @@ DEFAULT_UPSTREAM_JITTER = 1.0
 # When retry attempts are exhausted and the provider gave no Retry-After
 # hint, assume it needs a long rest instead of the ~60s capped backoff.
 DEFAULT_PROVIDER_COOLDOWN = 24.0 * 60.0 * 60.0
+# A single in-flight request should never sit through a long recovery wait
+# just to find out the provider is still unavailable. Short backoffs (a few
+# seconds) are fine to wait out inline -- they're usually a quick transient
+# hiccup. Anything longer means this request should fail over to the next
+# fallback candidate immediately; the episode still remembers the real
+# ready_at/terminal_until for whichever request arrives after that time.
+MAX_LOCAL_RECOVERY_WAIT = 10.0
 
 _quiet_discovery = ContextVar("quiet_discovery_recovery_logs", default=False)
 
@@ -596,6 +603,16 @@ class ProviderAdmissionController:
                 self._maintain_idle_episodes()
             if episode.leader is execution and not episode.probe_active:
                 delay = max(0.0, episode.ready_at - time.monotonic())
+                if delay > MAX_LOCAL_RECOVERY_WAIT:
+                    _log_recovery(
+                        "Provider {} needs {:.1f}s to recover; failing this "
+                        "request over now instead of waiting it out",
+                        self._provider_name,
+                        delay,
+                    )
+                    episode.leader = None
+                    self._notify_recovery_waiters()
+                    raise ProviderRecoveryExhausted(episode.last_error)
                 if delay > 0:
                     _log_recovery(
                         "Provider {} recovery active, waiting {:.1f}s for one probe",
